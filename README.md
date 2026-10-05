@@ -8,16 +8,89 @@ import os
 import io
 import json
 import sys
+import time
+import ctypes
+import logging
+import platform
+import tempfile
 import threading
 import webbrowser
 import urllib.request
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
-from rembg import remove
-from PIL import Image
+from rembg import new_session, remove
+from PIL import Image, ImageFile
+
+# Tolerar imagenes truncadas (ej: descarga del banner cortada por conexion lenta)
+ImageFile.LOAD_TRUNCATED_IMAGES = True
+
+# ── Proteccion para ejecutables empaquetados con --windowed ───────────────────
+# Sin consola, sys.stdout/stderr pueden ser None y cualquier print() explota
+# con "NoneType object has no attribute 'write'". Esto lo evita.
+if sys.stdout is None:
+    sys.stdout = open(os.devnull, "w")
+if sys.stderr is None:
+    sys.stderr = open(os.devnull, "w")
 
 EXTENSIONES_VALIDAS = (".jpg", ".jpeg", ".png", ".webp")
+
+# ── Logging a archivo, independiente de la interfaz ────────────────────────────
+# Si la ventana se congela, esto nos permite ver igual qué pasó paso a paso.
+LOG_DIR = os.path.join(os.environ.get("LOCALAPPDATA", tempfile.gettempdir()), "RyA_QuitaFondo")
+os.makedirs(LOG_DIR, exist_ok=True)
+LOG_PATH = os.path.join(LOG_DIR, "log.txt")
+
+logging.basicConfig(
+    filename=LOG_PATH,
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    encoding="utf-8",
+)
+logger = logging.getLogger("quitafondo")
+
+
+def obtener_ram_total_gb():
+    """RAM total del sistema en GB, usando la API de Windows via ctypes (sin dependencias extra)."""
+    try:
+        class MEMORYSTATUSEX(ctypes.Structure):
+            _fields_ = [
+                ("dwLength", ctypes.c_ulong),
+                ("dwMemoryLoad", ctypes.c_ulong),
+                ("ullTotalPhys", ctypes.c_ulonglong),
+                ("ullAvailPhys", ctypes.c_ulonglong),
+                ("ullTotalPageFile", ctypes.c_ulonglong),
+                ("ullAvailPageFile", ctypes.c_ulonglong),
+                ("ullTotalVirtual", ctypes.c_ulonglong),
+                ("ullAvailVirtual", ctypes.c_ulonglong),
+                ("sullAvailExtendedVirtual", ctypes.c_ulonglong),
+            ]
+        stat = MEMORYSTATUSEX()
+        stat.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
+        ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat))
+        return round(stat.ullTotalPhys / (1024 ** 3), 1)
+    except Exception:
+        return None
+
+
+def log_info_hardware():
+    """Registra las características del equipo al iniciar, para poder diagnosticar
+    después si algo tarda o se cuelga en un equipo puntual."""
+    try:
+        ram_gb = obtener_ram_total_gb()
+        info = (
+            f"Sistema: {platform.system()} {platform.release()} ({platform.version()}) | "
+            f"CPU: {platform.processor() or 'desconocida'} | "
+            f"Núcleos lógicos: {os.cpu_count()} | "
+            f"RAM total: {ram_gb if ram_gb is not None else 'desconocida'} GB | "
+            f"Python: {platform.python_version()} | "
+            f"Ejecutable empaquetado: {getattr(sys, 'frozen', False)}"
+        )
+        logger.info(info)
+        return {"ram_gb": ram_gb, "nucleos": os.cpu_count()}
+    except Exception as e:
+        logger.info(f"No se pudo obtener info de hardware: {e}")
+        return {"ram_gb": None, "nucleos": os.cpu_count()}
 
 
 def get_app_dir():
@@ -25,6 +98,14 @@ def get_app_dir():
     if getattr(sys, "frozen", False):
         return os.path.dirname(sys.executable)
     return os.path.dirname(os.path.abspath(__file__))
+
+
+def resource_path(relative_path):
+    """Ruta a un recurso empaquetado (ej: el .ico), tanto en desarrollo como
+    dentro del .exe compilado con --onefile (PyInstaller extrae los datos
+    agregados con --add-data a una carpeta temporal apuntada por sys._MEIPASS)."""
+    base_path = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(base_path, relative_path)
 
 # ── Nombre interno de esta app (para diferenciar metricas) ───────────────────
 APP_ID = "quitar_fondo"
@@ -86,6 +167,47 @@ def load_config():
         return {k: v.copy() for k, v in LOCAL_CONFIG.items()}
 
 
+_region_cache = None
+
+
+def obtener_region_aprox():
+    """Pais/region aproximados segun la IP publica (no GPS, no datos exactos).
+    Se cachea en memoria para no consultarlo mas de una vez por sesion."""
+    global _region_cache
+    if _region_cache is not None:
+        return _region_cache
+
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+
+    # Intento 1: ipapi.co
+    try:
+        req = urllib.request.Request("https://ipapi.co/json/", headers=headers)
+        with urllib.request.urlopen(req, timeout=5) as r:
+            data = json.loads(r.read().decode("utf-8"))
+        pais = data.get("country_name", "")
+        region = data.get("region", "")
+        if pais or region:
+            _region_cache = f"{pais} - {region}".strip(" -")
+            return _region_cache
+    except Exception as e:
+        print(f"DEBUG ipapi.co error: {e}")
+
+    # Intento 2 (respaldo): ipinfo.io
+    try:
+        req = urllib.request.Request("https://ipinfo.io/json", headers=headers)
+        with urllib.request.urlopen(req, timeout=5) as r:
+            data = json.loads(r.read().decode("utf-8"))
+        pais = data.get("country", "")
+        region = data.get("region", "")
+        _region_cache = f"{pais} - {region}".strip(" -")
+        return _region_cache
+    except Exception as e:
+        print(f"DEBUG ipinfo.io error: {e}")
+
+    _region_cache = ""
+    return _region_cache
+
+
 def send_metric(metrics_url, banner_id, event):
     """Envia metrica al servidor en hilo separado. Falla silenciosamente."""
     if not metrics_url:
@@ -97,6 +219,7 @@ def send_metric(metrics_url, banner_id, event):
                 "app": APP_ID,
                 "banner_id": banner_id,
                 "event": event,
+                "region": obtener_region_aprox(),
             }).encode("utf-8")
             req = urllib.request.Request(
                 metrics_url,
@@ -221,16 +344,21 @@ class QuitarFondoApp(tk.Tk):
         self.configure(bg=BG)
         self.resizable(False, False)
 
+        logger.info("=" * 60)
+        logger.info("Iniciando R&A QuitaFondo...")
+        self._hw_info = log_info_hardware()
+        self._session = None  # se crea en el primer uso, ver _obtener_session()
+
         self.modo = tk.StringVar(value="archivo")
         self.ruta_entrada = tk.StringVar()
         self.carpeta_salida = tk.StringVar()
         self._config = LOCAL_CONFIG.copy()
 
-        self._ico_path = os.path.join(get_app_dir(), "pixcut.ico")
+        self._ico_path = resource_path("pixcut.ico")
         try:
             self.wm_iconbitmap(self._ico_path)
         except Exception as e:
-            print(f"DEBUG iconbitmap error: {e}")
+            logger.info(f"iconbitmap error: {e}")
 
         self.attributes("-alpha", 0.0)
         self.withdraw()
@@ -360,7 +488,10 @@ class QuitarFondoApp(tk.Tk):
         self.boton_procesar.pack(fill="x", padx=20, pady=(10, 6))
 
         self.barra_progreso = ttk.Progressbar(self, mode="determinate")
-        self.barra_progreso.pack(fill="x", padx=20, pady=(0, 6))
+        self.barra_progreso.pack(fill="x", padx=20, pady=(0, 2))
+
+        self.label_tiempo = tk.Label(self, text="", bg=BG, fg=TEXT2, font=FONT_SM, anchor="w")
+        self.label_tiempo.pack(fill="x", padx=20, pady=(0, 4))
 
         # --- Banner publicitario ---
         self.banner_frame = tk.Frame(self, bg="#ffffff", cursor="hand2", height=80)
@@ -414,6 +545,16 @@ class QuitarFondoApp(tk.Tk):
             self.carpeta_salida.set(ruta)
 
     def escribir_log(self, texto):
+        """Seguro para llamar desde cualquier hilo: si no estamos en el hilo
+        principal de Tkinter, reprograma la actualización real vía self.after
+        en vez de tocar el widget directamente (Tkinter no es thread-safe)."""
+        logger.info(texto)
+        if threading.current_thread() is not threading.main_thread():
+            self.after(0, self._escribir_log_ui, texto)
+        else:
+            self._escribir_log_ui(texto)
+
+    def _escribir_log_ui(self, texto):
         self.log.config(state="normal")
         self.log.insert("end", texto + "\n")
         self.log.see("end")
@@ -452,31 +593,100 @@ class QuitarFondoApp(tk.Tk):
 
         self.boton_procesar.config(state="disabled", text="Procesando...")
         self.barra_progreso.config(maximum=len(archivos), value=0)
+        self.label_tiempo.config(text="")
 
-        hilo = threading.Thread(target=self._procesar_imagenes, args=(carpeta_base, salida, archivos, modo))
+        hilo = threading.Thread(target=self._procesar_imagenes, args=(carpeta_base, salida, archivos, modo), daemon=True)
         hilo.start()
 
+    def _obtener_session(self):
+        """Crea (o reutiliza) la sesion de rembg. Separado de remove() para poder
+        medir y loguear la descarga/carga del modelo por separado de la inferencia."""
+        if self._session is not None:
+            return self._session
+
+        ya_descargado = os.path.isdir(os.path.join(os.path.expanduser("~"), ".u2net"))
+        self.escribir_log(
+            "Descargando modelo de IA (primera vez, puede tardar según tu conexión)..."
+            if not ya_descargado else
+            "Cargando modelo de IA en memoria..."
+        )
+        t0 = time.time()
+        self._session = new_session("u2net")
+        logger.info(f"Sesion de rembg lista en {time.time() - t0:.1f}s")
+        return self._session
+
+    def _actualizar_progreso_ui(self, i, texto_tiempo):
+        self.barra_progreso.config(value=i)
+        self.label_tiempo.config(text=texto_tiempo)
+
     def _procesar_imagenes(self, carpeta_base, salida, archivos, modo):
+        total = len(archivos)
+        self.escribir_log(f"Se van a procesar {total} imagen(es).\n")
+        logger.info(f"Núcleos: {self._hw_info.get('nucleos')} | RAM total: {self._hw_info.get('ram_gb')} GB")
+
+        duraciones = []
+
+        try:
+            self._obtener_session()
+        except Exception as e:
+            self.escribir_log(f"✘ ERROR cargando el modelo de IA: {e}")
+            logger.exception("Fallo al cargar el modelo")
+            self.after(0, self._finalizar_proceso, modo)
+            self.after(0, lambda: messagebox.showerror("Error", f"No se pudo cargar el modelo de IA:\n{e}"))
+            return
+
         for i, nombre in enumerate(archivos, start=1):
             ruta_entrada = os.path.join(carpeta_base, nombre)
             nombre_salida = os.path.splitext(nombre)[0] + "_sin_fondo.png"
             ruta_salida = os.path.join(salida, nombre_salida)
 
-            self.escribir_log(f"Procesando: {nombre}...")
+            self.escribir_log(f"[{i}/{total}] {nombre}")
+            t_inicio = time.time()
+
+            # Heartbeat: mientras remove() esta trabajando, avisamos cada 10s
+            # que seguimos vivos (para diferenciar "lento" de "colgado").
+            detener_heartbeat = threading.Event()
+
+            def heartbeat(nombre=nombre, inicio=t_inicio, detener=detener_heartbeat):
+                segundos = 10
+                while not detener.wait(segundos):
+                    transcurrido = time.time() - inicio
+                    self.escribir_log(f"    ...sigue procesando {nombre} ({transcurrido:.0f}s transcurridos)")
+
+            hilo_heartbeat = threading.Thread(target=heartbeat, daemon=True)
+
             try:
+                self.escribir_log("  • Abriendo imagen...")
                 imagen = Image.open(ruta_entrada)
-                resultado = remove(imagen)
+
+                self.escribir_log("  • Quitando fondo con IA (puede tardar varios segundos)...")
+                hilo_heartbeat.start()
+                resultado = remove(imagen, session=self._session)
+                detener_heartbeat.set()
+
+                self.escribir_log("  • Guardando resultado...")
                 resultado.save(ruta_salida)
-                self.escribir_log(f"  -> Guardado: {nombre_salida}")
+
+                duracion = time.time() - t_inicio
+                duraciones.append(duracion)
+                self.escribir_log(f"  ✔ Listo: {nombre_salida}  ({duracion:.1f}s)\n")
             except Exception as e:
-                self.escribir_log(f"  -> ERROR con {nombre}: {e}")
+                detener_heartbeat.set()
+                self.escribir_log(f"  ✘ ERROR con {nombre}: {e}\n")
+                logger.exception(f"Fallo procesando {nombre}")
 
-            self.barra_progreso.config(value=i)
+            restantes = total - i
+            promedio = sum(duraciones) / len(duraciones) if duraciones else 0
+            texto_tiempo = f"Promedio: {promedio:.1f}s/imagen · restante estimado: {promedio * restantes:.0f}s" if restantes and promedio else ""
+            self.after(0, self._actualizar_progreso_ui, i, texto_tiempo)
 
-        self.escribir_log("\n✅ Proceso terminado.")
+        self.escribir_log("✅ Proceso terminado.")
+        self.after(0, self._finalizar_proceso, modo)
+        self.after(0, lambda: messagebox.showinfo("Listo", "¡Proceso finalizado!"))
+
+    def _finalizar_proceso(self, modo):
         texto_boton = "Quitar fondo" if modo == "archivo" else "Quitar fondo a todas las imágenes"
         self.boton_procesar.config(state="normal", text=texto_boton)
-        messagebox.showinfo("Listo", "¡Proceso finalizado!")
 
 
 if __name__ == "__main__":

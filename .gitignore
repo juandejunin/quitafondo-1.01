@@ -1,3 +1,38 @@
+
+
+# ── PyInstaller (se regeneran con tu comando) ──
+build/
+dist/
+*.spec
+
+# ── Python ──
+__pycache__/
+*.py[cod]
+*.pyo
+
+# ── Entornos virtuales ──
 venv/
 __pycache__/
 *.pyc
+.venv/
+env/
+
+# ── Modelos de IA de rembg (se descargan solos en ~/.u2net) ──
+.u2net/
+*.onnx
+
+# ── Logs ──
+*.log
+log.txt
+
+# ── Editores / IDE ──
+.vscode/
+.idea/
+
+# ── Sistema ──
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# ── Pruebas locales (imágenes de ejemplo y resultados) ──
+*_sin_fondo.png
