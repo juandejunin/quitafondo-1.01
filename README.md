@@ -16,7 +16,14 @@ Usa [rembg](https://github.com/danielgatis/rembg) con el modelo `u2net`, y el pr
 
 ## Descarga
 
-Descarga el ejecutable `QuitaFondo.exe` desde la sección [Releases](../../releases) del repositorio. No necesitas instalar Python.
+La forma más fácil de usar la app es descargar la versión ya compilada, sin instalar Python ni nada más:
+
+1. Entra en la sección [Releases](../../releases) del repositorio.
+2. En la versión más reciente, descarga el archivo `.zip` (por ejemplo, `QuitaFondo.zip`) desde **Assets**.
+3. Descomprime el `.zip` en la carpeta que quieras.
+4. Abre `QuitaFondo.exe`.
+
+> **Aviso de Windows:** como el ejecutable no está firmado digitalmente, Windows SmartScreen o tu antivirus pueden mostrar una advertencia la primera vez. Si descargaste el archivo desde este repositorio, puedes elegir **Más información → Ejecutar de todos modos**.
 
 > **Primer inicio:** la app descarga el modelo de IA (unos cientos de MB), por lo que necesitas conexión a internet y puede tardar varios minutos según tu conexión. Esto solo ocurre una vez; en los siguientes inicios la app arranca lista para usar.
 
